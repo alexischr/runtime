@@ -192,6 +192,143 @@ namespace System.Reflection.Emit
 
         int GetToken(SignatureHelper helper);
     }
+    /// <summary>
+    /// Scope Tree is a class that track the scope structure within a method body
+    /// It keeps track two parallel array. m_ScopeAction keeps track the action. It can be
+    /// OpenScope or CloseScope. m_iOffset records the offset where the action
+    /// takes place.
+    /// </summary>
+    internal enum ScopeAction : sbyte
+    {
+        Open = -0x1,
+        Close = 0x1
+    }
+
+    internal sealed class ScopeTree
+    {
+        internal ScopeTree()
+        {
+            // initialize data variables
+            m_iOpenScopeCount = 0;
+            m_iCount = 0;
+        }
+
+        /// <summary>
+        /// Find the current active lexical scope. For example, if we have
+        /// "Open Open Open Close",
+        /// we will return 1 as the second BeginScope is currently active.
+        /// </summary>
+        internal int GetCurrentActiveScopeIndex()
+        {
+            if (m_iCount == 0)
+            {
+                return -1;
+            }
+
+            int i = m_iCount - 1;
+
+            for (int cClose = 0; cClose > 0 || m_ScopeActions[i] == ScopeAction.Close; i--)
+            {
+                cClose += (sbyte)m_ScopeActions[i];
+            }
+
+            return i;
+        }
+
+        internal void AddLocalSymInfoToCurrentScope(
+            string strName,
+            byte[] signature,
+            int slot,
+            int startOffset,
+            int endOffset)
+        {
+            int i = GetCurrentActiveScopeIndex();
+            m_localSymInfos[i] ??= new LocalSymInfo();
+            m_localSymInfos[i]!.AddLocalSymInfo(strName, signature, slot, startOffset, endOffset); // TODO-NULLABLE: Indexer nullability tracked (https://github.com/dotnet/roslyn/issues/34644)
+        }
+
+        internal void AddUsingNamespaceToCurrentScope(string strNamespace)
+        {
+            int i = GetCurrentActiveScopeIndex();
+            m_localSymInfos[i] ??= new LocalSymInfo();
+            m_localSymInfos[i]!.AddUsingNamespace(strNamespace); // TODO-NULLABLE: Indexer nullability tracked (https://github.com/dotnet/roslyn/issues/34644)
+        }
+
+        internal void AddScopeInfo(ScopeAction sa, int iOffset)
+        {
+            if (sa == ScopeAction.Close && m_iOpenScopeCount <= 0)
+            {
+                throw new ArgumentException(SR.Argument_UnmatchingSymScope);
+            }
+
+            // make sure that arrays are large enough to hold addition info
+            EnsureCapacity();
+
+            m_ScopeActions[m_iCount] = sa;
+            m_iOffsets[m_iCount] = iOffset;
+            m_localSymInfos[m_iCount] = null;
+            checked { m_iCount++; }
+
+            m_iOpenScopeCount += -(sbyte)sa;
+        }
+
+        /// <summary>
+        /// Helper to ensure arrays are large enough
+        /// </summary>
+        internal void EnsureCapacity()
+        {
+            if (m_iCount == 0)
+            {
+                // First time. Allocate the arrays.
+                m_iOffsets = new int[InitialSize];
+                m_ScopeActions = new ScopeAction[InitialSize];
+                m_localSymInfos = new LocalSymInfo[InitialSize];
+            }
+            else if (m_iCount == m_iOffsets.Length)
+            {
+                // the arrays are full. Enlarge the arrays
+                // It would probably be simpler to just use Lists here.
+                int newSize = checked(m_iCount * 2);
+                int[] temp = new int[newSize];
+                Array.Copy(m_iOffsets, temp, m_iCount);
+                m_iOffsets = temp;
+
+                ScopeAction[] tempSA = new ScopeAction[newSize];
+                Array.Copy(m_ScopeActions, tempSA, m_iCount);
+                m_ScopeActions = tempSA;
+
+                LocalSymInfo[] tempLSI = new LocalSymInfo[newSize];
+                Array.Copy(m_localSymInfos, tempLSI, m_iCount);
+                m_localSymInfos = tempLSI;
+            }
+        }
+
+        internal void EmitScopeTree(ISymbolWriter symWriter)
+        {
+            for (int i = 0; i < m_iCount; i++)
+            {
+                if (m_ScopeActions[i] == ScopeAction.Open)
+                {
+                    symWriter.OpenScope(m_iOffsets[i]);
+                }
+                else
+                {
+                    symWriter.CloseScope(m_iOffsets[i]);
+                }
+                if (m_localSymInfos[i] != null)
+                {
+                    m_localSymInfos[i]!.EmitLocalSymInfo(symWriter); // TODO-NULLABLE: Indexer nullability tracked (https://github.com/dotnet/roslyn/issues/34644)
+                }
+            }
+        }
+
+        internal int[] m_iOffsets = null!;                 // array of offsets
+        internal ScopeAction[] m_ScopeActions = null!;             // array of scope actions
+        internal int m_iCount;                   // how many entries in the arrays are occupied
+        internal int m_iOpenScopeCount;          // keep track how many scopes are open
+        internal const int InitialSize = 16;
+        internal LocalSymInfo?[] m_localSymInfos = null!;            // keep track debugging local information
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     public partial class ILGenerator
@@ -242,6 +379,8 @@ namespace System.Reflection.Emit
 
         private List<SequencePointList>? sequencePointLists;
         private SequencePointList? currentSequence;
+
+        internal ScopeTree m_ScopeTree;            // this variable tracks all debugging scope information
 
         internal ILGenerator(Module m, ITokenGenerator token_gen, int size)
         {
